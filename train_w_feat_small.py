@@ -4,9 +4,9 @@ os.environ['DGLBACKEND'] = 'pytorch'
 
 import dgl
 import torch
-import torch.nn as nn
+# import torch.nn as nn
 import torch.nn.functional as F
-from ogb.linkproppred import DglLinkPropPredDataset, Evaluator
+# from ogb.linkproppred import DglLinkPropPredDataset, Evaluator
 from dgl.dataloading.negative_sampler import GlobalUniform
 from torch.utils.data import DataLoader
 import tqdm
@@ -14,14 +14,69 @@ import argparse
 from loss import auc_loss, hinge_auc_loss, log_rank_loss
 from model import Hadamard_MLPPredictor, GCN_v1, DotPredictor, LightGCN, PureGCN
 import time
-import numpy as np
-import scipy.sparse as sp
-import wandb
+# import numpy as np
+# import scipy.sparse as sp
+# import wandb
 import math
+# from sklearn.metrics import roc_auc_score, accuracy_score
+
+import pickle
+from lp_common import Logger
+import sklearn.metrics as skm
+
+
+def metric(predicted, score, ground_truth, multi_class=False):
+    if len(predicted) == 0:
+        Logger.log("predicted value is empty.")
+        return
+
+    if multi_class:
+        # accuracy
+        accuracy = skm.accuracy_score(ground_truth, predicted)
+
+        labels = set()
+        for e in ground_truth:
+            labels.add(e)
+
+        # Micro-F1
+        micro_f1 = skm.f1_score(ground_truth, predicted, labels=list(labels), average="micro")
+
+        # Macro-F1
+        macro_f1 = skm.f1_score(ground_truth, predicted, labels=list(labels), average="macro")
+
+        # Logger.log("Acc: {:.4f} Micro-F1: {:.4f} Macro-F1: {:.4f}".format(accuracy, micro_f1, macro_f1))
+        return accuracy, micro_f1, macro_f1
+    else:
+        # auc
+        auc = skm.roc_auc_score(ground_truth, score)
+
+        # accuracy
+        accuracy = skm.accuracy_score(ground_truth, predicted)
+
+        # recall
+        recall = skm.recall_score(ground_truth, predicted)
+
+        # precision
+        precision = skm.precision_score(ground_truth, predicted)
+
+        # F1
+        f1 = skm.f1_score(ground_truth, predicted)
+
+        # AUPR
+        pr, re, _ = skm.precision_recall_curve(ground_truth, score)
+        aupr = skm.auc(re, pr)
+
+        # AP
+        ap = skm.average_precision_score(ground_truth, score)
+
+        # Logger.log("Acc: {:.4f} AUC: {:.4f} Pr: {:.4f} Re: {:.4f} F1: {:.4f} AUPR: {:.4f} AP: {:.4f}".format(accuracy, auc, precision, recall, f1, aupr, ap))
+        return accuracy, auc, precision, recall, f1, aupr, ap
+
 
 def parse():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default='Cora', choices=['Cora', 'CiteSeer', 'PubMed'], type=str)
+    # parser.add_argument("--dataset", default='Cora', choices=['Cora', 'CiteSeer', 'PubMed'], type=str)
+    parser.add_argument("--dataset", default='Cora', type=str)
     parser.add_argument("--lr", default=0.01, type=float)
     parser.add_argument("--prop_step", default=8, type=int)
     parser.add_argument("--emb_hidden", default=0, type=int)
@@ -63,6 +118,10 @@ def parse():
     # New flag: if specified, run a wandb sweep.
     parser.add_argument("--sweep", action="store_true", help="Run hyperparameter sweep using wandb")
     args = parser.parse_args()
+
+
+
+    Logger.path = f"./output/{args.dataset}.log"
     return args
 
 def eval_hits(y_pred_pos, y_pred_neg, K):
@@ -134,7 +193,7 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None
     print(f"Epoch time: {time.time() - st:.4f}", flush=True)
     return total_loss / len(dataloader)
 
-def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None):
+def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None, multiclass=False):
     model.eval()
     pred.eval()
     with torch.no_grad():
@@ -158,10 +217,28 @@ def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None):
             neg_score.append(neg_pred)
         neg_score = torch.cat(neg_score, dim=0)
         results = {}
-        for k in [1, 3, 10, 100]:
+        for k in [100]:
             results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-        mrr_dict = eval_mrr(pos_score, neg_score.repeat(pos_score.size(0), 1))
-        results['mrr'] = mrr_dict['mrr']
+        # for k in [1, 3, 10, 100]:
+        #     results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
+        # mrr_dict = eval_mrr(pos_score, neg_score.repeat(pos_score.size(0), 1))
+        # results['mrr'] = mrr_dict['mrr']
+
+        # Calculate ACC and AUC
+        # Combine positive and negative scores
+        all_scores = torch.cat([pos_score, neg_score], dim=0)
+        all_labels = torch.cat([torch.ones(pos_score.size(0)), torch.zeros(neg_score.size(0))], dim=0)
+
+        # Convert to numpy for sklearn metrics
+        all_scores_np = torch.sigmoid(all_scores).cpu().numpy()
+        all_preds = (all_scores_np > 0.5).astype(int)
+        all_labels_np = all_labels.cpu().numpy()
+        if multiclass:
+            results['accuracy'], results['micro_f1'], results['macro_f1'] = metric(all_preds, all_scores_np, all_labels_np)
+            results['auc']
+        else:
+            results['accuracy'], results['auc'], results['precision'], results['recall'], results['f1'], results['aupr'], results['ap'] = metric(all_preds, all_scores_np, all_labels_np)
+
     return results
 
 def eval_model(model, g, pos_valid_edge, neg_valid_edge, pos_train_edge, pred, embedding=None):
@@ -213,8 +290,8 @@ def train_test_split_edges(
     row, col = data.edges()
 
     # Return upper triangular portion.
-    mask = row < col
-    row, col = row[mask], col[mask]
+    # mask = row < col
+    # row, col = row[mask], col[mask]
 
     n_v = int(math.floor(val_ratio * row.size(0)))
     n_t = int(math.floor(test_ratio * row.size(0)))
@@ -251,7 +328,8 @@ def train_test_split_edges(
 
     return data
 
-def random_split_edges(data, val_ratio=0.1, test_ratio=0.2):
+# def random_split_edges(data, val_ratio=0.1, test_ratio=0.2):
+def random_split_edges(data, val_ratio=0.1, test_ratio=0.5):
     result = train_test_split_edges(data, val_ratio=val_ratio, test_ratio=test_ratio)
 
     split_edge = {'train': {}, 'valid': {}, 'test': {}}
@@ -262,14 +340,25 @@ def random_split_edges(data, val_ratio=0.1, test_ratio=0.2):
     split_edge['test']['edge_neg'] = result.test_neg_edge_index.t()
     return split_edge
 
-def load_data(dataset):
-    if dataset == 'Cora':
-        dataset = dgl.data.CoraGraphDataset()
-    elif dataset == 'CiteSeer':
-        dataset = dgl.data.CiteseerGraphDataset()
-    elif dataset == 'PubMed':
-        dataset = dgl.data.PubmedGraphDataset()
-    data = dataset[0]
+def load_data(dataset, multiclass=False):
+    # if dataset == 'Cora':
+    #     dataset = dgl.data.CoraGraphDataset()
+    # elif dataset == 'CiteSeer':
+    #     dataset = dgl.data.CiteseerGraphDataset()
+    # elif dataset == 'PubMed':
+    #     dataset = dgl.data.PubmedGraphDataset()
+
+    with open(f"./input/{dataset}.pkl", 'rb') as file:
+        if multiclass:
+            x, edge_index, y, edge_label = pickle.load(file)
+        else:
+            x, edge_index, y = pickle.load(file)
+
+    
+
+    data = dgl.graph((edge_index[0], edge_index[1]), num_nodes=len(x))
+    data.ndata['feat'] = torch.tensor(x, dtype=torch.float32)
+    # data = dataset[0]
     split_edge = random_split_edges(data)
     graph = dgl.graph((split_edge['train']['edge'][:, 0], split_edge['train']['edge'][:, 1]), num_nodes=data.num_nodes())
     graph = dgl.to_bidirected(graph)
@@ -291,19 +380,22 @@ def run_experiment(run_idx, sweep_mode=False):
     dgl.seed(args.seed + run_idx)
 
     # Always initialize wandb (with reinit=True) so that wandb.config is available.
-    if sweep_mode:
-        wandb.init(project='Refined-GAE', reinit=True, name=f'run_{run_idx}')
-    else:
-        wandb.init(project='Refined-GAE', config=args, reinit=True, name=f'run_{run_idx}')
+    # if sweep_mode:
+    #     wandb.init(project='Refined-GAE', reinit=True, name=f'run_{run_idx}')
+    # else:
+    #     wandb.init(project='Refined-GAE', config=args, reinit=True, name=f'run_{run_idx}')
 
     # Override defaults with wandb.config values (if present).
 
-    if sweep_mode:
-        config = wandb.config
-        for key in config.keys():
-            setattr(args, key, config[key])
+    # if sweep_mode:
+    #     config = wandb.config
+    #     for key in config.keys():
+    #         setattr(args, key, config[key])
 
-    device = torch.device('cuda', args.gpu) if torch.cuda.is_available() else torch.device('cpu')
+    if args.dataset == "blogcatalog":
+        device = torch.device('cpu')
+    else:
+        device = torch.device('cuda', args.gpu) if torch.cuda.is_available() else torch.device('cpu')
 
     graph, split_edge = load_data(args.dataset)
     graph = graph.to(device)
@@ -394,17 +486,17 @@ def run_experiment(run_idx, sweep_mode=False):
             break
         print(f"Epoch {epoch}, Loss: {loss:.4f}, Train {args.metric}: {train_results[args.metric]:.4f}, "
               f"Valid {args.metric}: {valid_results[args.metric]:.4f}, Test {args.metric}: {test_results[args.metric]:.4f}")
-        wandb.log({'train_' + args.metric: train_results[args.metric],
-                   'valid_' + args.metric: valid_results[args.metric],
-                   'test_' + args.metric: test_results[args.metric],
-                   'loss': loss})
+        # wandb.log({'train_' + args.metric: train_results[args.metric],
+                #    'valid_' + args.metric: valid_results[args.metric],
+                #    'test_' + args.metric: test_results[args.metric],
+                #    'loss': loss})
     print("Final Test Results for this run:")
     for k, v in final_test_result.items():
         print(f"{k}: {v:.4f}", end=' ')
     print(f"\nTest {args.metric}: {final_test_result[args.metric]:.4f}")
 
-    wandb.log({'final_' + args.metric: final_test_result[args.metric]})
-    wandb.finish()
+    # wandb.log({'final_' + args.metric: final_test_result[args.metric]})
+    # wandb.finish()
     return final_test_result
 
 # =========================
@@ -423,11 +515,11 @@ def run_once():
     for key in keys:
         avg_results[key] = sum(result[key] for result in final_results_list) / num_runs
         stds[key] = math.sqrt(sum((result[key] - avg_results[key])**2 for result in final_results_list) / num_runs)
-    print("\nAverage final test results over 5 runs:")
+    Logger.log("\nAverage final test results over 5 runs:")
     for key, value in avg_results.items():
-        print(f"{key}: {value:.4f}", end=' ')
+        Logger.log(f"{key}: {value:.4f}")
     for key, value in stds.items():
-        print(f"{key}_std: {value:.4f}", end=' ')
+        Logger.log(f"{key}_std: {value:.4f}")
     print()
     return avg_results
 
@@ -453,9 +545,9 @@ def sweep_train():
     for key, value in avg_results.items():
         print(f"{key}: {value:.4f}", end=' ')
     print()
-    temp_run = wandb.init(project='Refined-GAE', reinit=True)
-    wandb.log({'avg_' + args.metric: avg_results[args.metric]})
-    wandb.finish()
+    # temp_run = wandb.init(project='Refined-GAE', reinit=True)
+    # wandb.log({'avg_' + args.metric: avg_results[args.metric]})
+    # wandb.finish()
 
 def main_sweep():
     """
@@ -486,9 +578,9 @@ def main_sweep():
         }
     }
     # Create a new sweep.
-    sweep_id = wandb.sweep(sweep_config, project='Refined-GAE')
+    # sweep_id = wandb.sweep(sweep_config, project='Refined-GAE')
     # Launch the sweep agent.
-    wandb.agent(sweep_id, function=sweep_train)
+    # wandb.agent(sweep_id, function=sweep_train)
 
 def main():
     global args
