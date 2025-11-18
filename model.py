@@ -5,13 +5,13 @@ import dgl
 from dgl.nn import GraphConv, SAGEConv, GATConv, GINConv
 
 class Hadamard_MLPPredictor(nn.Module):
-    def __init__(self, h_feats, dropout, layer=2, res=False, norm=False, scale=False, act='relu'):
+    def __init__(self, h_feats, dropout, layer=2, res=False, norm=False, scale=False, act='relu', out=1):
         super().__init__()
         self.lins = torch.nn.ModuleList()
         self.lins.append(torch.nn.Linear(h_feats, h_feats))
         for _ in range(layer - 2):
             self.lins.append(torch.nn.Linear(h_feats, h_feats))
-        self.lins.append(torch.nn.Linear(h_feats, 1))
+        self.lins.append(torch.nn.Linear(h_feats, out))
         self.dropout = dropout
         self.res = res
         self.scale = scale

@@ -9,12 +9,12 @@ import torch.nn.functional as F
 # from ogb.linkproppred import DglLinkPropPredDataset, Evaluator
 from dgl.dataloading.negative_sampler import GlobalUniform
 from torch.utils.data import DataLoader
-import tqdm
+# import tqdm
 import argparse
 from loss import auc_loss, hinge_auc_loss, log_rank_loss
 from model import Hadamard_MLPPredictor, GCN_v1, DotPredictor, LightGCN, PureGCN
 import time
-# import numpy as np
+import numpy as np
 # import scipy.sparse as sp
 # import wandb
 import math
@@ -24,13 +24,32 @@ import pickle
 from lp_common import Logger
 import sklearn.metrics as skm
 
+context = {}
 
-def metric(predicted, score, ground_truth, multi_class=False):
+
+def metric(pos_score, neg_score, pos_label):
+    results = {}
+    
+    if context["multiclass"]:
+        all_scores = pos_score
+        all_labels_np = np.array(pos_label)
+
+        all_scores_np = torch.sigmoid(all_scores)
+        all_preds = torch.argmax(all_scores_np, axis=1).cpu().numpy()
+    else:
+        all_scores = torch.cat([pos_score, neg_score], dim=0)
+        all_labels = torch.cat([pos_label, torch.zeros(neg_score.size(0))], dim=0)
+        all_labels_np = all_labels.cpu().numpy()
+
+        all_scores_np = torch.sigmoid(all_scores).cpu().numpy()
+        all_preds = (all_scores_np > 0.5).astype(int)
+
+    predicted, score, ground_truth = all_preds, all_scores_np, all_labels_np
     if len(predicted) == 0:
         Logger.log("predicted value is empty.")
         return
 
-    if multi_class:
+    if context["multiclass"]:
         # accuracy
         accuracy = skm.accuracy_score(ground_truth, predicted)
 
@@ -45,7 +64,7 @@ def metric(predicted, score, ground_truth, multi_class=False):
         macro_f1 = skm.f1_score(ground_truth, predicted, labels=list(labels), average="macro")
 
         # Logger.log("Acc: {:.4f} Micro-F1: {:.4f} Macro-F1: {:.4f}".format(accuracy, micro_f1, macro_f1))
-        return accuracy, micro_f1, macro_f1
+        results['accuracy'], results['micro_f1'], results['macro_f1'] = accuracy, micro_f1, macro_f1
     else:
         # auc
         auc = skm.roc_auc_score(ground_truth, score)
@@ -70,7 +89,8 @@ def metric(predicted, score, ground_truth, multi_class=False):
         ap = skm.average_precision_score(ground_truth, score)
 
         # Logger.log("Acc: {:.4f} AUC: {:.4f} Pr: {:.4f} Re: {:.4f} F1: {:.4f} AUPR: {:.4f} AP: {:.4f}".format(accuracy, auc, precision, recall, f1, aupr, ap))
-        return accuracy, auc, precision, recall, f1, aupr, ap
+        results['accuracy'], results['auc'], results['precision'], results['recall'], results['f1'], results['aupr'], results['ap'] = accuracy, auc, precision, recall, f1, aupr, ap
+    return results
 
 
 def parse():
@@ -87,7 +107,8 @@ def parse():
     parser.add_argument("--epochs", default=100, type=int)
     parser.add_argument("--interval", default=100, type=int)
     parser.add_argument("--step_lr_decay", action='store_true', default=True)
-    parser.add_argument("--metric", default='hits@100', type=str)
+    # parser.add_argument("--metric", default='hits@100', type=str)
+    parser.add_argument("--metric", default='accuracy', type=str)
     parser.add_argument("--gpu", default=0, type=int)
     parser.add_argument("--relu", action='store_true', default=False)
     parser.add_argument("--seed", default=0, type=int)
@@ -108,6 +129,7 @@ def parse():
     parser.add_argument("--use_node_embedding", action='store_true', default=False)
     parser.add_argument("--only_node_embedding", action='store_true', default=False)
     parser.add_argument("--exp", action='store_true', default=False)
+    parser.add_argument("--multiclass", action='store_true', default=False)
     parser.add_argument("--scale", action='store_true', default=False)
     parser.add_argument("--linear", action='store_true', default=False)
     parser.add_argument("--optimizer", default='adam', type=str)
@@ -119,7 +141,10 @@ def parse():
     parser.add_argument("--sweep", action="store_true", help="Run hyperparameter sweep using wandb")
     args = parser.parse_args()
 
-
+    if args.multiclass:
+        context["multiclass"] = True
+    else:
+        context["multiclass"] = False
 
     Logger.path = f"./output/{args.dataset}.log"
     return args
@@ -144,7 +169,7 @@ def adjustlr(optimizer, decay_ratio, lr):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr_
 
-def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None):
+def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, edge_labels, embedding=None):
     st = time.time()
     model.train()
     pred.train()
@@ -152,7 +177,7 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None
     total_loss = 0
     if args.maskinput:
         mask = torch.ones(train_pos_edge.size(0), dtype=torch.bool)
-    for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
+    for _, edge_index in enumerate(dataloader):
         if args.only_node_embedding:
             xemb = embedding.weight
         else:
@@ -174,6 +199,7 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None
         neg_train_edge = neg_sampler(g, pos_edge.t()[0])
         neg_train_edge = torch.stack(neg_train_edge, dim=0).t()
         pos_score = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
+        pos_label = edge_labels[edge_index]
         neg_score = pred(h[neg_train_edge[:, 0]], h[neg_train_edge[:, 1]])
         if args.loss == 'auc':
             loss = auc_loss(pos_score, neg_score, args.num_neg)
@@ -182,7 +208,12 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None
         elif args.loss == 'rank':
             loss = log_rank_loss(pos_score, neg_score, args.num_neg)
         else:
-            loss = (F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) +
+            if context["multiclass"]:
+                # loss = (F.cross_entropy(pos_score, pos_label) +
+                #     F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score)))
+                loss = F.cross_entropy(pos_score, pos_label)
+            else:
+                loss = (F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) +
                     F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score)))
         optimizer.zero_grad()
         loss.backward()
@@ -190,10 +221,10 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None
         torch.nn.utils.clip_grad_norm_(pred.parameters(), 1.0)
         optimizer.step()
         total_loss += loss.item()
-    print(f"Epoch time: {time.time() - st:.4f}", flush=True)
+    # print(f"Epoch time: {time.time() - st:.4f}", flush=True)
     return total_loss / len(dataloader)
 
-def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None, multiclass=False):
+def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None):
     model.eval()
     pred.eval()
     with torch.no_grad():
@@ -204,40 +235,27 @@ def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None, multiclas
         h = model(g, xemb)
         dataloader = DataLoader(range(pos_test_edge.size(0)), args.batch_size)
         pos_score = []
-        for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
+        pos_label = []
+        for _, edge_index in enumerate(dataloader):
             pos_edge = pos_test_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
             pos_score.append(pos_pred)
+            if context["multiclass"]:
+                for edge in pos_edge:
+                    pos_label.append(context["edge_label_dict"][tuple(edge.detach().cpu().numpy())])
         pos_score = torch.cat(pos_score, dim=0)
         dataloader = DataLoader(range(neg_test_edge.size(0)), args.batch_size)
         neg_score = []
-        for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
+        for _, edge_index in enumerate(dataloader):
             neg_edge = neg_test_edge[edge_index]
             neg_pred = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
             neg_score.append(neg_pred)
         neg_score = torch.cat(neg_score, dim=0)
-        results = {}
-        for k in [100]:
-            results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-        # for k in [1, 3, 10, 100]:
-        #     results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-        # mrr_dict = eval_mrr(pos_score, neg_score.repeat(pos_score.size(0), 1))
-        # results['mrr'] = mrr_dict['mrr']
-
-        # Calculate ACC and AUC
-        # Combine positive and negative scores
-        all_scores = torch.cat([pos_score, neg_score], dim=0)
-        all_labels = torch.cat([torch.ones(pos_score.size(0)), torch.zeros(neg_score.size(0))], dim=0)
-
-        # Convert to numpy for sklearn metrics
-        all_scores_np = torch.sigmoid(all_scores).cpu().numpy()
-        all_preds = (all_scores_np > 0.5).astype(int)
-        all_labels_np = all_labels.cpu().numpy()
-        if multiclass:
-            results['accuracy'], results['micro_f1'], results['macro_f1'] = metric(all_preds, all_scores_np, all_labels_np)
-            results['auc']
-        else:
-            results['accuracy'], results['auc'], results['precision'], results['recall'], results['f1'], results['aupr'], results['ap'] = metric(all_preds, all_scores_np, all_labels_np)
+    
+    if context["multiclass"]:
+        results = metric(pos_score, neg_score, pos_label)
+    else:
+        results = metric(pos_score, neg_score, torch.ones(pos_score.size(0)))
 
     return results
 
@@ -252,33 +270,47 @@ def eval_model(model, g, pos_valid_edge, neg_valid_edge, pos_train_edge, pred, e
         h = model(g, xemb)
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
         pos_score = []
-        for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
+        pos_label = []
+        for _, edge_index in enumerate(dataloader):
             pos_edge = pos_valid_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
             pos_score.append(pos_pred)
+            if context["multiclass"]:
+                for edge in pos_edge:
+                    pos_label.append(context["edge_label_dict"][tuple(edge.detach().cpu().numpy())])
         pos_score = torch.cat(pos_score, dim=0)
         dataloader = DataLoader(range(neg_valid_edge.size(0)), args.batch_size)
         neg_score = []
-        for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
+        for _, edge_index in enumerate(dataloader):
             neg_edge = neg_valid_edge[edge_index]
             neg_pred = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
             neg_score.append(neg_pred)
         neg_score = torch.cat(neg_score, dim=0)
-        valid_results = {}
-        for k in [1, 3, 10, 100]:
-            valid_results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-        valid_results['mrr'] = eval_mrr(pos_score, neg_score.repeat(pos_score.size(0), 1))['mrr']
+        if context["multiclass"]:
+            valid_results = metric(pos_score, neg_score, pos_label)
+        else:
+            valid_results = metric(pos_score, neg_score, torch.ones(pos_score.size(0)))
+        # for k in [1, 3, 10, 100]:
+        #     valid_results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
+        # valid_results['mrr'] = eval_mrr(pos_score, neg_score.repeat(pos_score.size(0), 1))['mrr']
         dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
         pos_score_train = []
-        for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
+        pos_label_train = []
+        for _, edge_index in enumerate(dataloader):
             pos_edge = pos_train_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
             pos_score_train.append(pos_pred)
+            if context["multiclass"]:
+                for edge in pos_edge:
+                    pos_label_train.append(context["edge_label_dict"][tuple(edge.detach().cpu().numpy())])
         pos_score_train = torch.cat(pos_score_train, dim=0)
-        train_results = {}
-        for k in [1, 3, 10, 100]:
-            train_results[f'hits@{k}'] = eval_hits(pos_score_train, neg_score, k)[f'hits@{k}']
-        train_results['mrr'] = eval_mrr(pos_score_train, neg_score.repeat(pos_score_train.size(0), 1))['mrr']
+        if context["multiclass"]:
+            train_results = metric(pos_score_train, neg_score, pos_label_train)
+        else:
+            train_results = metric(pos_score_train, neg_score, torch.ones(pos_score.size(0)))
+        # for k in [1, 3, 10, 100]:
+        #     train_results[f'hits@{k}'] = eval_hits(pos_score_train, neg_score, k)[f'hits@{k}']
+        # train_results['mrr'] = eval_mrr(pos_score_train, neg_score.repeat(pos_score_train.size(0), 1))['mrr']
     return train_results, valid_results
 
 def train_test_split_edges(
@@ -340,7 +372,7 @@ def random_split_edges(data, val_ratio=0.1, test_ratio=0.5):
     split_edge['test']['edge_neg'] = result.test_neg_edge_index.t()
     return split_edge
 
-def load_data(dataset, multiclass=False):
+def load_data(dataset):
     # if dataset == 'Cora':
     #     dataset = dgl.data.CoraGraphDataset()
     # elif dataset == 'CiteSeer':
@@ -349,12 +381,24 @@ def load_data(dataset, multiclass=False):
     #     dataset = dgl.data.PubmedGraphDataset()
 
     with open(f"./input/{dataset}.pkl", 'rb') as file:
-        if multiclass:
+        if context["multiclass"]:
             x, edge_index, y, edge_label = pickle.load(file)
+            edge_label_dict = dict()
+            edge_class_set = set()
+
+            for i in range(len(edge_label)):
+                edge_class_set.add(edge_label[i])
+            context["num_class"] = len(edge_class_set)
+
+            l2i = dict()
+            for index, label in enumerate(edge_class_set):
+                l2i[label] = index
+
+            for i in range(len(edge_label)):
+                edge_label_dict[(edge_index[0][i], edge_index[1][i])] = l2i[edge_label[i]]
+            context["edge_label_dict"] = edge_label_dict
         else:
             x, edge_index, y = pickle.load(file)
-
-    
 
     data = dgl.graph((edge_index[0], edge_index[1]), num_nodes=len(x))
     data.ndata['feat'] = torch.tensor(x, dtype=torch.float32)
@@ -375,9 +419,9 @@ def run_experiment(run_idx, sweep_mode=False):
     We now always call wandb.init() so that wandb.config is available.
     """
     # Set seeds.
-    torch.manual_seed(args.seed + run_idx)
-    torch.cuda.manual_seed_all(args.seed + run_idx)
-    dgl.seed(args.seed + run_idx)
+    # torch.manual_seed(args.seed + run_idx)
+    # torch.cuda.manual_seed_all(args.seed + run_idx)
+    # dgl.seed(args.seed + run_idx)
 
     # Always initialize wandb (with reinit=True) so that wandb.config is available.
     # if sweep_mode:
@@ -399,6 +443,16 @@ def run_experiment(run_idx, sweep_mode=False):
 
     graph, split_edge = load_data(args.dataset)
     graph = graph.to(device)
+
+    if context["multiclass"]:
+        edge_labels = []
+        for edge in split_edge['train']['edge']:
+            edge_labels.append(context["edge_label_dict"][tuple(edge.numpy())])
+        edge_labels = torch.tensor(edge_labels, dtype=torch.long)
+    else:
+        edge_labels = torch.ones_like(split_edge['train']['edge'])
+    edge_labels = edge_labels.to(device)
+
     train_pos_edge = split_edge['train']['edge'].to(device)
     valid_pos_edge = split_edge['valid']['edge'].to(device)
     valid_neg_edge = split_edge['valid']['edge_neg'].to(device)
@@ -422,7 +476,10 @@ def run_experiment(run_idx, sweep_mode=False):
     if args.pred == 'dot':
         pred = DotPredictor().to(device)
     elif args.pred == 'mlp':
-        pred = Hadamard_MLPPredictor(args.hidden, args.dropout, args.mlp_layers, args.res, args.norm, args.scale, args.activation).to(device)
+        if context["multiclass"]:
+            pred = Hadamard_MLPPredictor(args.hidden, args.dropout, args.mlp_layers, args.res, args.norm, args.scale, args.activation, out=context["num_class"]).to(device)
+        else:
+            pred = Hadamard_MLPPredictor(args.hidden, args.dropout, args.mlp_layers, args.res, args.norm, args.scale, args.activation).to(device)
     else:
         raise NotImplementedError
 
@@ -455,7 +512,7 @@ def run_experiment(run_idx, sweep_mode=False):
     else:
         raise NotImplementedError
 
-    best_val = 0
+    best_val = -1
     final_test_result = None
     best_epoch = 0
     losses = []
@@ -470,7 +527,7 @@ def run_experiment(run_idx, sweep_mode=False):
 
     # --- Training Loop ---
     for epoch in range(args.epochs):
-        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, embedding)
+        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, edge_labels, embedding)
         losses.append(loss)
         if epoch % args.interval == 0 and args.step_lr_decay:
             adjustlr(optimizer, epoch / args.epochs, args.lr)
@@ -482,18 +539,19 @@ def run_experiment(run_idx, sweep_mode=False):
             best_val = valid_results[args.metric]
             best_epoch = epoch
             final_test_result = test_results
-        if epoch - best_epoch >= 200:
-            break
-        print(f"Epoch {epoch}, Loss: {loss:.4f}, Train {args.metric}: {train_results[args.metric]:.4f}, "
+        # if epoch - best_epoch >= 200:
+        #     break
+        if epoch % 50 == 0:
+            print(f"Epoch {epoch}, Loss: {loss:.4f}, Train {args.metric}: {train_results[args.metric]:.4f}, "
               f"Valid {args.metric}: {valid_results[args.metric]:.4f}, Test {args.metric}: {test_results[args.metric]:.4f}")
         # wandb.log({'train_' + args.metric: train_results[args.metric],
                 #    'valid_' + args.metric: valid_results[args.metric],
                 #    'test_' + args.metric: test_results[args.metric],
                 #    'loss': loss})
-    print("Final Test Results for this run:")
-    for k, v in final_test_result.items():
-        print(f"{k}: {v:.4f}", end=' ')
-    print(f"\nTest {args.metric}: {final_test_result[args.metric]:.4f}")
+    # print("Final Test Results for this run:")
+    # for k, v in final_test_result.items():
+    #     print(f"{k}: {v:.4f}", end=' ')
+    # print(f"\nTest {args.metric}: {final_test_result[args.metric]:.4f}")
 
     # wandb.log({'final_' + args.metric: final_test_result[args.metric]})
     # wandb.finish()
@@ -515,7 +573,7 @@ def run_once():
     for key in keys:
         avg_results[key] = sum(result[key] for result in final_results_list) / num_runs
         stds[key] = math.sqrt(sum((result[key] - avg_results[key])**2 for result in final_results_list) / num_runs)
-    Logger.log("\nAverage final test results over 5 runs:")
+    Logger.log(f"\nAverage final test results over {num_runs} runs:")
     for key, value in avg_results.items():
         Logger.log(f"{key}: {value:.4f}")
     for key, value in stds.items():
@@ -531,7 +589,7 @@ def sweep_train():
     Called by the wandb agent. In sweep mode we run 3 experiments (to average randomness)
     and log the averaged final metrics.
     """
-    num_runs = 5
+    num_runs = 1
     final_results_list = []
     for run_idx in range(num_runs):
         print(f"\nSweep mode: starting sub-run {run_idx+1}/{num_runs}")
