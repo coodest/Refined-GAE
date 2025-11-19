@@ -1,6 +1,5 @@
 # run in the same folder:
-# sudo docker image build ./docker --tag meetingdocker/ml:nodeimport
-
+# sudo docker image build ./docker --tag meetingdocker/ml:refinedgae
 FROM meetingdocker/ml:pt_0.3
 
 # RUN conda install geoopt==0.5.0 \
